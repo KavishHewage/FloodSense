@@ -1,0 +1,687 @@
+"""
+FloodSense – Fusion 360 API Script  v6.0
+=========================================
+Changes from v5.0:
+  1. WALL_T increased from 4mm → 5mm throughout.
+  2. O-ring grooves are now EXTERNAL perimeter channels instead of
+     annular face-grooves.  At each mating face a rectangular slot
+     (ORING_W × ORING_D) is removed from the *outside* of the wall,
+     centred on the joint face.  The upper unit contributes the top
+     half of the groove and the lower unit contributes the bottom half;
+     together they form a 2×ORING_D deep channel that captures the
+     O-ring when the two units are pushed together.
+
+     Groove placement (one call per mating face per unit):
+       Base   top    → groove on top    face  (at_top=True,  flip=False)
+       Middle bottom → groove on bottom face  (at_top=False, flip=True)
+       Middle top    → groove on top    face  (at_top=True,  flip=False)
+       Top    bottom → groove on bottom face  (at_top=False, flip=True)
+
+All snap-fit geometry and other features retained unchanged.
+"""
+
+import adsk.core, adsk.fusion, traceback
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  PARAMETERS
+# ═══════════════════════════════════════════════════════════════════════════
+
+UNIT_W  = 80.0
+UNIT_D  = 80.0
+WALL_T  = 5.0          # ← changed from 4.0
+FLOOR_T = 4.0
+
+CHAMBER_SIZE    = 40.0
+CHAMBER_FLOOR_T = 3.0
+CHAMBER_GAP     = 5.0
+CHAMBER_ROWS    = 4
+
+INLET_R     = 6.0
+INLET_DEPTH = 8.0
+
+LED_R     = 3.5
+LED_DEPTH = 4.5
+
+# O-ring groove – external perimeter channel
+# Each unit contributes half the depth; combined = 2×ORING_D when mated.
+ORING_W      = 2.8    # groove width (along wall height axis)
+ORING_D      = 2.0    # groove depth (inward from outside face)
+ORING_INSET  = 0.0    # offset of groove centre from the joint face (0 = flush)
+
+ROOF_OVERHANG = 7.0
+ROOF_APEX_H   = 25.0
+SOLAR_W       = 60.0
+SOLAR_D       = 60.0
+SOLAR_DEPTH   = 2.0
+
+BASE_H = 200.0
+MID_H  = 200.0
+TOP_H  = 200.0
+
+GAP = 110.0
+
+# ── Snap-fit parameters ──────────────────────────────────────────────────
+SNAP_ARM_W   = 12.0
+SNAP_ARM_T   = 2.0
+SNAP_ARM_L   = 8.0
+SNAP_HOOK_H  = 1.5
+SNAP_HOOK_P  = 0.6
+SNAP_CLR     = 0.2
+SNAP_SIDE_CY = -10.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  DERIVED GEOMETRY CONSTANTS
+# ═══════════════════════════════════════════════════════════════════════════
+
+FRONT_OUTER_Y    = -UNIT_D / 2.0
+FRONT_INNER_Y    = FRONT_OUTER_Y + WALL_T
+DIVIDER_FRONT_Y  = -(WALL_T / 2.0)
+
+FRONT_AVAIL_D    = DIVIDER_FRONT_Y - FRONT_INNER_Y
+CHAMBER_POCKET_Y = min(CHAMBER_SIZE, FRONT_AVAIL_D - 1.0)
+FRONT_HALF_CY    = (FRONT_INNER_Y + DIVIDER_FRONT_Y) / 2.0
+
+FLOOR_SLAB_W = UNIT_W - 2 * WALL_T
+FLOOR_SLAB_D = FRONT_AVAIL_D
+
+DIVIDER_BACK_Y  = WALL_T / 2.0
+BACK_INNER_Y    = UNIT_D / 2.0 - WALL_T
+BACK_AVAIL_D    = BACK_INNER_Y - DIVIDER_BACK_Y
+BACK_HALF_CY    = (DIVIDER_BACK_Y + BACK_INNER_Y) / 2.0
+BACK_OPEN_W     = UNIT_W - 2 * WALL_T
+
+INNER_R = UNIT_W / 2.0 - WALL_T   # 35mm with WALL_T=5
+
+SNAP_WALLS = [
+    dict(name="Front", axis='Y', inner_face=FRONT_INNER_Y, sign=+1, span_center=0.0),
+    dict(name="Left",  axis='X', inner_face=-INNER_R,      sign=+1, span_center=SNAP_SIDE_CY),
+    dict(name="Right", axis='X', inner_face=+INNER_R,      sign=-1, span_center=SNAP_SIDE_CY),
+]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  UTILITIES
+# ═══════════════════════════════════════════════════════════════════════════
+
+def cm(mm): return mm / 10.0
+
+def new_comp(design, name):
+    occ = design.rootComponent.occurrences.addNewComponent(adsk.core.Matrix3D.create())
+    c = occ.component
+    c.name = name
+    return c, occ
+
+def move_occ(occ, dx, dy, dz=0):
+    t = adsk.core.Matrix3D.create()
+    t.translation = adsk.core.Vector3D.create(cm(dx), cm(dy), cm(dz))
+    occ.transform = t
+
+def hz_plane(comp, z_mm):
+    p = comp.constructionPlanes
+    i = p.createInput()
+    i.setByOffset(comp.xYConstructionPlane, adsk.core.ValueInput.createByReal(cm(z_mm)))
+    return p.add(i)
+
+def rt_plane(comp, x_mm):
+    p = comp.constructionPlanes
+    i = p.createInput()
+    i.setByOffset(comp.yZConstructionPlane, adsk.core.ValueInput.createByReal(cm(x_mm)))
+    return p.add(i)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  SKETCH HELPERS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def rect(sk, cx, cy, w, h):
+    p0 = adsk.core.Point3D.create(cm(cx - w/2), cm(cy - h/2), 0)
+    p1 = adsk.core.Point3D.create(cm(cx + w/2), cm(cy + h/2), 0)
+    sk.sketchCurves.sketchLines.addTwoPointRectangle(p0, p1)
+
+def rect_minmax(sk, x0, x1, y0, y1):
+    p0 = adsk.core.Point3D.create(cm(x0), cm(y0), 0)
+    p1 = adsk.core.Point3D.create(cm(x1), cm(y1), 0)
+    sk.sketchCurves.sketchLines.addTwoPointRectangle(p0, p1)
+
+def circle(sk, cx, cy, r):
+    sk.sketchCurves.sketchCircles.addByCenterRadius(
+        adsk.core.Point3D.create(cm(cx), cm(cy), 0), cm(r))
+
+def first_prof(sk):
+    return sk.profiles.item(0) if sk.profiles.count > 0 else None
+
+def annular_prof(sk, ow, od, iw, id_):
+    target = cm(ow) * cm(od) - cm(iw) * cm(id_)
+    best, best_diff = None, float('inf')
+    for p in sk.profiles:
+        try:
+            diff = abs(p.areaProperties().area - target)
+            if diff < best_diff:
+                best_diff, best = diff, p
+        except:
+            pass
+    return best
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  BOOLEAN HELPERS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def make_body(comp, prof, depth_mm, flip=False):
+    if prof is None:
+        return None
+    sign = -1 if flip else 1
+    n_pre = comp.bRepBodies.count
+    try:
+        f   = comp.features.extrudeFeatures
+        inp = f.createInput(prof, adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
+        inp.setDistanceExtent(False, adsk.core.ValueInput.createByReal(sign * cm(abs(depth_mm))))
+        f.add(inp)
+        if comp.bRepBodies.count > n_pre:
+            return comp.bRepBodies.item(comp.bRepBodies.count - 1)
+    except Exception as e:
+        print(f"  make_body failed: {e}")
+    return None
+
+def cut_from(comp, shell, cutters):
+    if not shell or not cutters:
+        return False
+    col = adsk.core.ObjectCollection.create()
+    for c in cutters:
+        if c:
+            col.add(c)
+    if col.count == 0:
+        return False
+    try:
+        inp = comp.features.combineFeatures.createInput(shell, col)
+        inp.operation    = adsk.fusion.FeatureOperations.CutFeatureOperation
+        inp.isKeepToolBodies = False
+        comp.features.combineFeatures.add(inp)
+        return True
+    except Exception as e:
+        print(f"  cut_from failed: {e}")
+        return False
+
+def join_to(comp, shell, adders):
+    if not shell or not adders:
+        return False
+    col = adsk.core.ObjectCollection.create()
+    for a in adders:
+        if a:
+            col.add(a)
+    if col.count == 0:
+        return False
+    try:
+        inp = comp.features.combineFeatures.createInput(shell, col)
+        inp.operation    = adsk.fusion.FeatureOperations.JoinFeatureOperation
+        inp.isKeepToolBodies = False
+        comp.features.combineFeatures.add(inp)
+        return True
+    except Exception as e:
+        print(f"  join_to failed: {e}")
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  SHELL
+# ═══════════════════════════════════════════════════════════════════════════
+
+def build_shell(comp, H):
+    print(f"\nBuilding shell (H={H}mm)…")
+
+    sk_out = comp.sketches.add(comp.xYConstructionPlane)
+    rect(sk_out, 0, 0, UNIT_W, UNIT_D)
+    shell = make_body(comp, first_prof(sk_out), H)
+    if not shell:
+        print("  ✗ Shell failed"); return None
+    print("  ✓ Outer box")
+
+    cav_h  = H - FLOOR_T - WALL_T
+    cav_pl = hz_plane(comp, FLOOR_T)
+    sk_cav = comp.sketches.add(cav_pl)
+    rect(sk_cav, 0, 0, UNIT_W - 2*WALL_T, UNIT_D - 2*WALL_T)
+    cavity = make_body(comp, first_prof(sk_cav), cav_h)
+    if cavity and cut_from(comp, shell, [cavity]):
+        print("  ✓ Interior cavity")
+    else:
+        print("  ✗ Cavity cut failed")
+
+    return shell
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  DIVIDING WALL
+# ═══════════════════════════════════════════════════════════════════════════
+
+def add_divider(comp, shell, H):
+    print("\nAdding central divider wall…")
+    interior_h = H - FLOOR_T - WALL_T
+    inner_w    = UNIT_W - 2 * WALL_T
+    pl         = hz_plane(comp, FLOOR_T)
+    sk         = comp.sketches.add(pl)
+    rect(sk, 0, 0, inner_w, WALL_T)
+    body = make_body(comp, first_prof(sk), interior_h)
+    if body and join_to(comp, shell, [body]):
+        print("  ✓ Divider joined")
+    else:
+        print("  ✗ Divider FAILED")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  CHAMBER SYSTEM
+# ═══════════════════════════════════════════════════════════════════════════
+
+def add_chamber_system(comp, shell, H, led_spacing):
+    print(f"\n{'='*60}")
+    print("CHAMBER SYSTEM")
+    print(f"{'='*60}")
+
+    interior_h = H - FLOOR_T - WALL_T
+
+    def stack_h(rows): return rows * CHAMBER_SIZE + (rows + 1) * CHAMBER_GAP
+
+    rows = CHAMBER_ROWS
+    while stack_h(rows) > interior_h and rows > 1:
+        rows -= 1
+
+    total_h = stack_h(rows)
+    start_z = FLOOR_T + (interior_h - total_h) / 2.0
+
+    floor_slabs   = []
+    pocket_tools  = []
+    inlet_tools   = []
+    led_tools     = []
+
+    right_plane = rt_plane(comp, UNIT_W / 2.0)
+
+    for row in range(rows):
+        n        = row + 1
+        z_bot    = start_z + CHAMBER_GAP + row * (CHAMBER_SIZE + CHAMBER_GAP)
+        z_top    = z_bot + CHAMBER_SIZE
+        z_centre = z_bot + CHAMBER_SIZE / 2.0
+
+        pl_fl  = hz_plane(comp, z_bot)
+        sk_fl  = comp.sketches.add(pl_fl)
+        rect(sk_fl, 0, FRONT_HALF_CY, FLOOR_SLAB_W, FLOOR_SLAB_D)
+        slab = make_body(comp, first_prof(sk_fl), CHAMBER_FLOOR_T)
+        if slab:
+            floor_slabs.append(slab)
+
+        pocket_z = z_bot + CHAMBER_FLOOR_T
+        pl_pk    = hz_plane(comp, pocket_z)
+        sk_pk    = comp.sketches.add(pl_pk)
+        rect(sk_pk, 0, FRONT_HALF_CY, CHAMBER_SIZE, CHAMBER_POCKET_Y)
+        pocket_h = CHAMBER_SIZE - CHAMBER_FLOOR_T
+        pocket   = make_body(comp, first_prof(sk_pk), pocket_h)
+        if pocket:
+            pocket_tools.append(pocket)
+
+        inlet_wall_cy = FRONT_OUTER_Y + WALL_T / 2.0
+        pl_in  = hz_plane(comp, z_centre)
+        sk_in  = comp.sketches.add(pl_in)
+        circle(sk_in, 0, inlet_wall_cy, INLET_R)
+        inlet  = make_body(comp, first_prof(sk_in), INLET_DEPTH)
+        if inlet:
+            inlet_tools.append(inlet)
+
+        if n % led_spacing == 0:
+            sk_led  = comp.sketches.add(right_plane)
+            circle(sk_led, FRONT_HALF_CY, z_centre, LED_R)
+            led_body = make_body(comp, first_prof(sk_led), LED_DEPTH, flip=True)
+            if led_body:
+                led_tools.append(led_body)
+
+    if floor_slabs  and join_to(comp, shell, floor_slabs):  print("  ✅ Floor slabs joined")
+    if pocket_tools and cut_from(comp, shell, pocket_tools): print("  ✅ Pockets cut")
+    if inlet_tools  and cut_from(comp, shell, inlet_tools):  print("  ✅ Inlet holes cut")
+    if led_tools    and cut_from(comp, shell, led_tools):    print("  ✅ LED holes cut")
+
+    print(f"{'='*60}\n")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  BACK-SIDE OPENINGS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def open_back_top(comp, shell, H):
+    print("  Back-side TOP opening…")
+    cut_z = H - WALL_T - 0.5
+    cut_h = WALL_T + 1.0
+    pl   = hz_plane(comp, cut_z)
+    sk   = comp.sketches.add(pl)
+    rect(sk, 0, BACK_HALF_CY, BACK_OPEN_W, BACK_AVAIL_D)
+    body = make_body(comp, first_prof(sk), cut_h)
+    if body and cut_from(comp, shell, [body]):
+        print("  ✅ Back TOP open")
+    else:
+        print("  ❌ Back TOP opening FAILED")
+
+
+def open_back_bottom(comp, shell):
+    print("  Back-side BOTTOM opening…")
+    cut_z = -0.5
+    cut_h = FLOOR_T + 1.0
+    pl   = hz_plane(comp, cut_z)
+    sk   = comp.sketches.add(pl)
+    rect(sk, 0, BACK_HALF_CY, BACK_OPEN_W, BACK_AVAIL_D)
+    body = make_body(comp, first_prof(sk), cut_h)
+    if body and cut_from(comp, shell, [body]):
+        print("  ✅ Back BOTTOM open")
+    else:
+        print("  ❌ Back BOTTOM opening FAILED")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  EXTERNAL PERIMETER O-RING GROOVE  (v6 replacement)
+#
+#  Removes a rectangular band from the outside of the wall at the joint
+#  face.  Each unit contributes ORING_D depth; when mated the two halves
+#  form a full channel of 2×ORING_D = 4mm (fits a 2.8mm cord O-ring).
+#
+#  at_top=True  → groove is at the TOP face   (z = H − ORING_D … H)
+#               extrude DOWN (flip=True), depth = ORING_D
+#  at_top=False → groove is at the BOTTOM face (z = 0 … ORING_D)
+#               extrude UP   (flip=False), depth = ORING_D
+#
+#  The groove profile in the XY plane is an annular ring whose outer edge
+#  is the unit footprint and whose inner edge is inset by ORING_D.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def add_oring_groove(comp, shell, H, at_top):
+    """External perimeter O-ring groove cut into the outer face of the wall."""
+    label = 'top' if at_top else 'bottom'
+    print(f"  External O-ring groove ({label})…")
+
+    # Groove band: outer = full unit footprint, inner = footprint − ORING_D
+    outer_half = UNIT_W / 2.0          # 40mm
+    inner_half = outer_half - ORING_D  # 38mm
+
+    # Plane at the joint face
+    z_plane = H if at_top else 0.0
+    pl = hz_plane(comp, z_plane)
+    sk = comp.sketches.add(pl)
+
+    # Draw outer and inner squares to create an annular profile
+    rect(sk, 0, 0, outer_half * 2, outer_half * 2)   # 80 × 80
+    rect(sk, 0, 0, inner_half * 2, inner_half * 2)   # 76 × 76
+
+    prof = annular_prof(sk,
+                        outer_half * 2, outer_half * 2,
+                        inner_half * 2, inner_half * 2)
+
+    # Extrude into the unit body
+    body = make_body(comp, prof, ORING_D, flip=at_top)
+    if body and cut_from(comp, shell, [body]):
+        print(f"  ✅ O-ring groove ({label}): "
+              f"{ORING_D}mm deep × {ORING_D}mm wide band on outside of wall")
+    else:
+        print(f"  ❌ O-ring groove ({label}) FAILED")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  SNAP-FIT CONNECTORS  (unchanged from v5)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _bounds(wall, normal_a, normal_b, span_extra=0.0):
+    n0, n1 = (normal_a, normal_b) if normal_a <= normal_b else (normal_b, normal_a)
+    s0 = wall['span_center'] - (SNAP_ARM_W / 2.0 + span_extra)
+    s1 = wall['span_center'] + (SNAP_ARM_W / 2.0 + span_extra)
+    if wall['axis'] == 'Y':
+        return s0, s1, n0, n1
+    else:
+        return n0, n1, s0, s1
+
+
+def add_male_snaps(comp, shell, H):
+    print(f"\n{'='*60}")
+    print(f"MALE SNAP ARMS (top face, Z={H}mm)")
+    print(f"{'='*60}")
+
+    arm_bodies  = []
+    hook_bodies = []
+
+    for wall in SNAP_WALLS:
+        ifc, sign = wall['inner_face'], wall['sign']
+
+        a_lo, a_hi = ifc, ifc + sign * SNAP_ARM_T
+        x0, x1, y0, y1 = _bounds(wall, a_lo, a_hi)
+        pl_arm = hz_plane(comp, H)
+        sk_arm = comp.sketches.add(pl_arm)
+        rect_minmax(sk_arm, x0, x1, y0, y1)
+        arm = make_body(comp, first_prof(sk_arm), SNAP_ARM_L)
+        if arm:
+            arm_bodies.append(arm)
+            print(f"  ✓ {wall['name']:5s} arm")
+
+        h_lo, h_hi = ifc, ifc + sign * (SNAP_ARM_T + SNAP_HOOK_P)
+        x0, x1, y0, y1 = _bounds(wall, h_lo, h_hi)
+        hook_z = H + SNAP_ARM_L - SNAP_HOOK_H
+        pl_hk  = hz_plane(comp, hook_z)
+        sk_hk  = comp.sketches.add(pl_hk)
+        rect_minmax(sk_hk, x0, x1, y0, y1)
+        hook = make_body(comp, first_prof(sk_hk), SNAP_HOOK_H)
+        if hook:
+            hook_bodies.append(hook)
+            print(f"  ✓ {wall['name']:5s} hook")
+
+    all_bodies = arm_bodies + hook_bodies
+    if all_bodies:
+        if join_to(comp, shell, all_bodies):
+            print("  ✅ Male snap arms joined")
+        else:
+            print("  ❌ Male snap join FAILED")
+
+    print(f"{'='*60}\n")
+
+
+def add_female_snaps(comp, shell):
+    print(f"\n{'='*60}")
+    print(f"FEMALE SNAP SLOTS (bottom face, Z=0mm)")
+    print(f"{'='*60}")
+
+    slot_bodies   = []
+    pocket_bodies = []
+
+    for wall in SNAP_WALLS:
+        ifc, sign = wall['inner_face'], wall['sign']
+
+        s_lo = ifc - sign * SNAP_CLR
+        s_hi = ifc + sign * (SNAP_ARM_T + SNAP_CLR)
+        x0, x1, y0, y1 = _bounds(wall, s_lo, s_hi, span_extra=SNAP_CLR)
+        slot_z = -0.5
+        slot_h = FLOOR_T + 1.0
+        pl_sl  = hz_plane(comp, slot_z)
+        sk_sl  = comp.sketches.add(pl_sl)
+        rect_minmax(sk_sl, x0, x1, y0, y1)
+        slot = make_body(comp, first_prof(sk_sl), slot_h)
+        if slot:
+            slot_bodies.append(slot)
+            print(f"  ✓ {wall['name']:5s} slot")
+
+        p_lo = ifc - sign * SNAP_CLR
+        p_hi = ifc + sign * (SNAP_ARM_T + SNAP_HOOK_P + SNAP_CLR)
+        x0, x1, y0, y1 = _bounds(wall, p_lo, p_hi, span_extra=SNAP_CLR)
+        pocket_z = FLOOR_T
+        pocket_h = SNAP_HOOK_H + SNAP_CLR
+        pl_pk  = hz_plane(comp, pocket_z)
+        sk_pk  = comp.sketches.add(pl_pk)
+        rect_minmax(sk_pk, x0, x1, y0, y1)
+        pocket = make_body(comp, first_prof(sk_pk), pocket_h)
+        if pocket:
+            pocket_bodies.append(pocket)
+            print(f"  ✓ {wall['name']:5s} pocket")
+
+    all_cuts = slot_bodies + pocket_bodies
+    if all_cuts:
+        if cut_from(comp, shell, all_cuts):
+            print("  ✅ Female snap slots cut")
+        else:
+            print("  ❌ Female snap cut FAILED")
+
+    print(f"{'='*60}\n")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  ROOF + SOLAR RECESS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def add_roof_and_solar(comp, shell, H):
+    half_d = UNIT_D / 2.0 + ROOF_OVERHANG
+    half_w = UNIT_W / 2.0 + ROOF_OVERHANG
+    sk_r   = comp.sketches.add(comp.yZConstructionPlane)
+    lines  = sk_r.sketchCurves.sketchLines
+    p_l = adsk.core.Point3D.create(cm(-half_d), cm(H - 1), 0)
+    p_r = adsk.core.Point3D.create(cm(half_d),  cm(H - 1), 0)
+    p_a = adsk.core.Point3D.create(0,            cm(H + ROOF_APEX_H), 0)
+    lines.addByTwoPoints(p_l, p_r)
+    lines.addByTwoPoints(p_r, p_a)
+    lines.addByTwoPoints(p_a, p_l)
+    if sk_r.profiles.count > 0:
+        try:
+            n_pre = comp.bRepBodies.count
+            f     = comp.features.extrudeFeatures
+            inp   = f.createInput(first_prof(sk_r),
+                                  adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
+            inp.setSymmetricExtent(adsk.core.ValueInput.createByReal(cm(half_w)), True)
+            f.add(inp)
+            if comp.bRepBodies.count > n_pre:
+                roof = comp.bRepBodies.item(comp.bRepBodies.count - 1)
+                join_to(comp, shell, [roof])
+                print("  ✓ Roof joined")
+        except Exception as e:
+            print(f"  ✗ Roof failed: {e}")
+
+    sol_pl = hz_plane(comp, H)
+    sk_s   = comp.sketches.add(sol_pl)
+    rect(sk_s, 0, 0, SOLAR_W, SOLAR_D)
+    sol = make_body(comp, first_prof(sk_s), SOLAR_DEPTH, flip=True)
+    if sol:
+        cut_from(comp, shell, [sol])
+        print("  ✓ Solar recess cut")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  UNITS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def build_base(design):
+    print("\n" + "█"*60)
+    print("  BUILD BASE")
+    print("█"*60)
+    comp, occ = new_comp(design, "FloodSense_Base")
+    shell = build_shell(comp, BASE_H)
+    if shell:
+        add_divider(comp, shell, BASE_H)
+        add_chamber_system(comp, shell, BASE_H, led_spacing=2)
+        open_back_top(comp, shell, BASE_H)
+        add_oring_groove(comp, shell, BASE_H, at_top=True)    # top joint face
+        add_male_snaps(comp, shell, BASE_H)
+    move_occ(occ, 0, 0)
+    return comp, occ
+
+
+def build_middle(design):
+    print("\n" + "█"*60)
+    print("  BUILD MIDDLE")
+    print("█"*60)
+    comp, occ = new_comp(design, "FloodSense_Middle")
+    shell = build_shell(comp, MID_H)
+    if shell:
+        add_divider(comp, shell, MID_H)
+        add_chamber_system(comp, shell, MID_H, led_spacing=2)
+        open_back_top(comp, shell, MID_H)
+        open_back_bottom(comp, shell)
+        add_oring_groove(comp, shell, MID_H, at_top=False)   # bottom joint face
+        add_oring_groove(comp, shell, MID_H, at_top=True)    # top joint face
+        add_female_snaps(comp, shell)
+        add_male_snaps(comp, shell, MID_H)
+    move_occ(occ, UNIT_W + GAP, 0)
+    return comp, occ
+
+
+def build_top(design):
+    print("\n" + "█"*60)
+    print("  BUILD TOP")
+    print("█"*60)
+    comp, occ = new_comp(design, "FloodSense_Top")
+    shell = build_shell(comp, TOP_H)
+    if shell:
+        add_divider(comp, shell, TOP_H)
+        add_chamber_system(comp, shell, TOP_H, led_spacing=1)
+        open_back_bottom(comp, shell)
+        add_oring_groove(comp, shell, TOP_H, at_top=False)   # bottom joint face
+        add_female_snaps(comp, shell)
+        add_roof_and_solar(comp, shell, TOP_H)
+    move_occ(occ, 2 * (UNIT_W + GAP), 0)
+    return comp, occ
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════════════════════
+
+def run(context):
+    ui = None
+    try:
+        app    = adsk.core.Application.get()
+        ui     = app.userInterface
+        design = app.activeProduct
+
+        if not isinstance(design, adsk.fusion.Design):
+            ui.messageBox("Please open a Fusion 360 Design document first.")
+            return
+
+        design.designType = adsk.fusion.DesignTypes.DirectDesignType
+
+        print("\n" + "="*60)
+        print("FLOODSENSE v6.0 — 5mm WALLS + EXTERNAL O-RING GROOVES")
+        print("="*60)
+
+        errors = []
+
+        for label, fn in [("Base", build_base), ("Middle", build_middle), ("Top", build_top)]:
+            try:
+                fn(design)
+            except Exception:
+                errors.append(f"{label}:\n{traceback.format_exc()}")
+
+        try:
+            app.activeViewport.fit()
+        except:
+            pass
+
+        if errors:
+            ui.messageBox("Errors:\n\n" + "\n\n".join(errors))
+        else:
+            ui.messageBox(
+                "✅  FloodSense v6.0  Complete!\n\n"
+
+                "CHANGES FROM v5:\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "• WALL_T: 4mm → 5mm\n"
+                "  (INNER_R now 35mm, all derived dims updated)\n\n"
+
+                "• O-ring grooves: internal annular → EXTERNAL perimeter band\n"
+                "  Each joint face gets a 2.0mm deep × 2.0mm wide channel\n"
+                "  cut into the OUTSIDE of the wall.\n"
+                "  Upper + lower unit each contribute half → 4mm combined\n"
+                "  channel captures a 2.8mm cross-section O-ring.\n\n"
+
+                "GROOVE LOCATIONS:\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "• Base   TOP    → external groove (mates with Middle bottom)\n"
+                "• Middle BOTTOM → external groove (mates with Base top)\n"
+                "• Middle TOP    → external groove (mates with Top bottom)\n"
+                "• Top    BOTTOM → external groove (mates with Middle top)\n\n"
+
+                "RETAINED (unchanged):\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "• Snap-fit connectors (3 per interface, Front/Left/Right)\n"
+                "• Chamber system, divider, back-side openings\n"
+                "• Roof + solar recess on Top unit")
+
+    except Exception:
+        if ui:
+            ui.messageBox("Error:\n\n" + traceback.format_exc())
